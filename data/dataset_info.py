@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .interleave_datasets import UnifiedEditIterableDataset
-from .t2i_dataset import T2IIterableDataset
+from .t2i_dataset import T2IIterableDataset, T2IJSONLIterableDataset
 from .vlm_dataset import SftJSONLIterableDataset
 
 
 DATASET_REGISTRY = {
     't2i_pretrain': T2IIterableDataset,
+    't2i_jsonl': T2IJSONLIterableDataset,
     'vlm_sft': SftJSONLIterableDataset,
     'unified_edit': UnifiedEditIterableDataset,
 }
@@ -19,6 +20,13 @@ DATASET_INFO = {
             'data_dir': 'your_data_path/bagel_example/t2i', # path of the parquet files
             'num_files': 10, # number of data units to be sharded across all ranks and workers
             'num_total_samples': 1000, # number of total samples in the dataset
+        },
+    },
+    't2i_jsonl': {
+        'pair_t2i': {
+            'data_dir': '/mnt/yanqi/projects/PAIR/images',
+            'jsonl_path': '/mnt/yanqi/projects/PAIR/data/prompts_final_images_checked.jsonl',
+            'num_total_samples': 2755,
         },
     },
     'unified_edit':{

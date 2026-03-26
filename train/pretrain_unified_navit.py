@@ -10,6 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from time import time
 from typing import Optional
+from tqdm.auto import tqdm
 
 import torch
 import torch.distributed as dist
@@ -26,6 +27,7 @@ from transformers.optimization import (
 )
 
 from data.dataset_base import DataConfig, PackedDataset, collate_wrapper
+from data.dataset_info import DATASET_INFO
 from data.data_utils import add_special_tokens
 from modeling.autoencoder import load_ae
 from modeling.bagel import (
@@ -93,6 +95,31 @@ def detect_peak_tflops(default_tflops: float) -> float:
     else:
         tflops = default_tflops
     return tflops
+
+
+def estimate_samples_per_epoch(dataset_meta: dict) -> int:
+    total_samples = 0
+    for grouped_dataset_name, grouped_args in dataset_meta.items():
+        dataset_names = grouped_args.get("dataset_names", [])
+        num_used_data = grouped_args.get("num_used_data", [])
+        for i, dataset_name in enumerate(dataset_names):
+            meta_info = DATASET_INFO.get(grouped_dataset_name, {}).get(dataset_name, {})
+            num_total_samples = meta_info.get("num_total_samples", None)
+            used_value = num_used_data[i] if i < len(num_used_data) else None
+
+            if num_total_samples is None and used_value is not None:
+                total_samples += int(used_value)
+                continue
+
+            if num_total_samples is None:
+                continue
+
+            if "jsonl_path" in meta_info and used_value is not None:
+                total_samples += int(min(num_total_samples, used_value))
+            else:
+                total_samples += int(num_total_samples)
+
+    return max(total_samples, 1)
 
 
 @dataclass
@@ -611,6 +638,7 @@ def main():
     # Setup packed dataloader
     with open(data_args.dataset_config_file, "r") as stream:
         dataset_meta = yaml.safe_load(stream)
+    samples_per_epoch = estimate_samples_per_epoch(dataset_meta)
     dataset_config = DataConfig(grouped_datasets=dataset_meta)
     if training_args.visual_und:
         dataset_config.vit_patch_size = model_args.vit_patch_size
@@ -659,6 +687,16 @@ def main():
     start_time = time()
     logger.info(f"Training for {training_args.total_steps} steps, starting at {train_step}...")
     optimizer.zero_grad()
+    progress_bar = None
+    global_sample_count = 0.0
+    current_epoch = global_sample_count / samples_per_epoch
+    if dist.get_rank() == 0:
+        progress_bar = tqdm(
+            total=training_args.total_steps,
+            initial=train_step,
+            desc="Training",
+            dynamic_ncols=True,
+        )
     total_norm = torch.tensor(0.0, device=device)
     token_window = 0.0
     seqlen_square_window = 0.0
@@ -732,6 +770,17 @@ def main():
             scheduler.step()
             fsdp_ema_update(ema_model, fsdp_model, decay=training_args.ema)
             optimizer.zero_grad()
+            step_samples = torch.tensor(float(len(data['sample_lens'])), device=device)
+            dist.all_reduce(step_samples, op=dist.ReduceOp.SUM)
+            global_sample_count += step_samples.item()
+            current_epoch = global_sample_count / samples_per_epoch
+            if progress_bar is not None:
+                progress_bar.update(1)
+                progress_bar.set_postfix(
+                    lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+                    epoch=f"{current_epoch:.2f}",
+                    refresh=False,
+                )
         
         # Log loss values:
         if curr_step % training_args.log_every == 0:
@@ -772,6 +821,7 @@ def main():
             wandb_log['tokens_per_step'] = tokens_per_step
             wandb_log['actual_tflops'] = actual_tflops
             wandb_log['mfu'] = mfu_value
+            wandb_log['epoch'] = current_epoch
 
             mem_allocated = torch.tensor(torch.cuda.max_memory_allocated() / 1024**2, device=device)
             dist.all_reduce(mem_allocated, op=dist.ReduceOp.MAX)
@@ -865,6 +915,9 @@ def main():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         logger.info(f"Final checkpoint saved at step {curr_step}")
+
+    if progress_bar is not None:
+        progress_bar.close()
     
     logger.info("Done!")
     if dist.get_rank() == 0:
